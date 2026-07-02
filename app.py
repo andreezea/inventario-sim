@@ -163,10 +163,13 @@ def try_barcode(image_pil):
     img = np.array(image_pil.convert("L"))
     candidates = []
     for result in zbar_decode(img):
-        data = result.data.decode("utf-8", errors="ignore")
-        digits = re.sub(r"\D", "", data)
-        if digits:
-            candidates.append(digits)
+        data = result.data.decode("utf-8", errors="ignore").strip()
+        # Solo considerar codigos de barras puramente numericos. El ICCID no
+        # lleva letras; otros codigos de la misma etiqueta (ej. IMEI/REIF)
+        # si suelen incluir una letra, y no queremos confundirlos con el ICCID.
+        if not data.isdigit():
+            continue
+        candidates.append(data)
     if not candidates:
         return None
     # Preferir un ICCID "clasico" (empieza en 89) entre todos los codigos leidos
