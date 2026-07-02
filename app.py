@@ -51,8 +51,11 @@ except Exception:
 
 DB_PATH = "inventario_sim.db"
 FOTOS_DIR = "fotos_chips"
-# ICCID: empieza en 89 (industria de telecom), 19-20 digitos en total
+# ICCID "clasico": empieza en 89 (industria de telecom), 18-20 digitos en total
 ICCID_REGEX = re.compile(r"89\d{16,18}")
+# Respaldo: cualquier corrida de 18-20 digitos seguidos (por si el OCR no
+# lee bien los primeros dos digitos, o el chip no sigue el prefijo 89).
+DIGIT_RUN_REGEX = re.compile(r"\d{18,20}")
 THUMB_PX = 90  # tamano de la miniatura embebida en el Excel
 
 # Lista de tiendas para el selector. Edita esta lista con los nombres reales.
@@ -142,7 +145,11 @@ def save_photo(iccid, img_bytes):
 # Deteccion del codigo: 1) barcode/QR  2) OCR  3) manual
 # ----------------------------------------------------------------------
 def _extract_iccid_from_digits(digits):
+    """Dado un string de puros digitos, intenta extraer un ICCID valido."""
     m = ICCID_REGEX.search(digits)
+    if m:
+        return m.group(0)
+    m = DIGIT_RUN_REGEX.search(digits)
     if m:
         return m.group(0)
     if len(digits) >= 15:
@@ -154,12 +161,28 @@ def try_barcode(image_pil):
     if not ZBAR_AVAILABLE:
         return None
     img = np.array(image_pil.convert("L"))
+    candidates = []
     for result in zbar_decode(img):
         data = result.data.decode("utf-8", errors="ignore")
         digits = re.sub(r"\D", "", data)
-        code = _extract_iccid_from_digits(digits)
-        if code:
-            return code
+        if digits:
+            candidates.append(digits)
+    if not candidates:
+        return None
+    # Preferir un ICCID "clasico" (empieza en 89) entre todos los codigos leidos
+    for digits in candidates:
+        m = ICCID_REGEX.search(digits)
+        if m:
+            return m.group(0)
+    # Si no, cualquier corrida de 18-20 digitos
+    for digits in candidates:
+        m = DIGIT_RUN_REGEX.search(digits)
+        if m:
+            return m.group(0)
+    # Ultimo recurso: el codigo mas largo leido
+    long_candidates = [d for d in candidates if len(d) >= 15]
+    if long_candidates:
+        return max(long_candidates, key=len)
     return None
 
 
@@ -172,17 +195,45 @@ def _preprocess_for_ocr(image_pil):
 
 
 def try_ocr(image_pil):
+    """Lee texto con OCR y busca un ICCID. Procesa linea por linea para no
+    mezclar digitos de distintas partes de la etiqueta (ej. ICCID vs IMEI)."""
     if not TESSERACT_AVAILABLE:
         return None
     processed = _preprocess_for_ocr(image_pil)
-    config = "--psm 6 -c tessedit_char_whitelist=0123456789"
-    try:
-        text = pytesseract.image_to_string(processed, config=config)
-    except Exception:
+    configs = [
+        "--psm 6 -c tessedit_char_whitelist=0123456789",
+        "--psm 11 -c tessedit_char_whitelist=0123456789",
+    ]
+
+    lines_digits = []
+    for config in configs:
+        try:
+            text = pytesseract.image_to_string(processed, config=config)
+        except Exception:
+            continue
+        for line in text.splitlines():
+            digits = re.sub(r"\D", "", line)
+            if digits:
+                lines_digits.append(digits)
+
+    if not lines_digits:
         return None
-    digits = re.sub(r"\D", "", text)
-    m = ICCID_REGEX.search(digits)
-    return m.group(0) if m else None
+
+    # 1) preferir un ICCID "clasico" (empieza en 89) en alguna linea
+    for digits in lines_digits:
+        m = ICCID_REGEX.search(digits)
+        if m:
+            return m.group(0)
+    # 2) si no, cualquier corrida de 18-20 digitos en alguna linea
+    for digits in lines_digits:
+        m = DIGIT_RUN_REGEX.search(digits)
+        if m:
+            return m.group(0)
+    # 3) ultimo recurso: la linea de digitos mas larga (>=15)
+    long_lines = [d for d in lines_digits if len(d) >= 15]
+    if long_lines:
+        return max(long_lines, key=len)
+    return None
 
 
 def detect_code(image_pil):
@@ -315,8 +366,9 @@ else:
 
     st.subheader("1. Escanear")
     st.caption(
-        "En celular: la vista de la camara trae un icono para cambiar entre camara "
-        "frontal y trasera. Usa la trasera para enfocar mejor el codigo del chip."
+        "En celular: usa la camara trasera. Acercate lo suficiente para que el "
+        "codigo de barras o el numero ICCID llenen la mayor parte del encuadre "
+        "(evita capturar toda la etiqueta completa) y procura buena luz sin brillos."
     )
     img_file = st.camera_input(
         "Toma una foto del ICCID / codigo de barras del chip",
