@@ -26,7 +26,7 @@ import streamlit as st
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 
 # ----------------------------------------------------------------------
 # Dependencias opcionales: la app debe seguir funcionando (modo manual)
@@ -150,6 +150,23 @@ def save_photo(iccid, img_bytes):
 # ----------------------------------------------------------------------
 # Deteccion de codigos: ICCID e IMEI/REIF, por codigo de barras/QR y OCR
 # ----------------------------------------------------------------------
+def _normalize_image(image_pil):
+    """Corrige la orientacion (segun metadatos EXIF de la camara) y mejora
+    contraste/nitidez antes de intentar leer el codigo de barras o el OCR.
+    No modifica la foto que se guarda como respaldo, solo la copia usada
+    para la deteccion."""
+    try:
+        image_pil = ImageOps.exif_transpose(image_pil)
+    except Exception:
+        pass
+    try:
+        image_pil = ImageEnhance.Contrast(image_pil).enhance(1.3)
+        image_pil = ImageEnhance.Sharpness(image_pil).enhance(1.5)
+    except Exception:
+        pass
+    return image_pil
+
+
 def _preprocess_for_ocr(image_pil):
     img = np.array(image_pil.convert("L"))
     if CV2_AVAILABLE:
@@ -193,6 +210,7 @@ def collect_candidates(image_pil):
 def detect_codes(image_pil):
     """Detecta el ICCID y, si existe, el IMEI/REIF (otro numero largo) en la
     foto. Devuelve (iccid, iccid_metodo, imei, imei_metodo)."""
+    image_pil = _normalize_image(image_pil)
     candidates = collect_candidates(image_pil)
     if not candidates:
         return None, "Manual", None, "Manual"
@@ -356,9 +374,10 @@ else:
 
     st.subheader("1. Escanear")
     st.caption(
-        "En celular: usa la camara trasera. Acercate lo suficiente para que los "
-        "codigos/numeros llenen la mayor parte del encuadre y procura buena luz "
-        "sin brillos. La app intenta leer el ICCID y el IMEI/REIF en la misma foto."
+        "En celular: usa la camara trasera, sostenla DE FRENTE al codigo (no en "
+        "angulo/inclinada), acercate para que los numeros llenen bien el encuadre, "
+        "y procura buena luz sin brillos ni sombras. "
+        "La app intenta leer el ICCID y el IMEI/REIF en la misma foto."
     )
     img_file = st.camera_input(
         "Toma una foto del ICCID / codigo de barras del chip",
