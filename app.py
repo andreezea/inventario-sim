@@ -1,10 +1,11 @@
 """
 Inventario de Chips SIM - App interna de control de inventario
 ================================================================
-Captura fotos con la camara del celular/laptop, detecta el ICCID por
-codigo de barras/QR (pyzbar) o por OCR (pytesseract), evita duplicados,
-muestra la lista en tiempo real, guarda la foto de cada chip y permite
-exportar todo (datos + miniaturas de fotos) a un Excel.
+Captura fotos con la camara del celular/laptop, detecta el ICCID y el
+IMEI/REIF por codigo de barras/QR (pyzbar) o por OCR (pytesseract),
+evita duplicados de ICCID, muestra la lista en tiempo real, guarda la
+foto de cada chip y permite exportar todo (datos + miniaturas de fotos)
+a un Excel.
 
 Incluye login de administrador (unico que puede descargar el Excel) y
 un selector de tienda que cada usuario elige una vez por sesion.
@@ -80,25 +81,29 @@ def get_connection():
             fecha_hora TEXT NOT NULL,
             metodo TEXT,
             foto_path TEXT,
-            tienda TEXT
+            tienda TEXT,
+            imei TEXT
         )
         """
     )
     # Migracion simple para bases de datos creadas con una version anterior
-    # de la app (sin columna foto_path / tienda).
+    # de la app (sin columna foto_path / tienda / imei).
     cols = [row[1] for row in conn.execute("PRAGMA table_info(chips)").fetchall()]
     if "foto_path" not in cols:
         conn.execute("ALTER TABLE chips ADD COLUMN foto_path TEXT")
     if "tienda" not in cols:
         conn.execute("ALTER TABLE chips ADD COLUMN tienda TEXT")
+    if "imei" not in cols:
+        conn.execute("ALTER TABLE chips ADD COLUMN imei TEXT")
     conn.commit()
     return conn
 
 
 def get_all(conn):
     return pd.read_sql_query(
-        "SELECT iccid AS ICCID, tienda AS Tienda, fecha_hora AS 'Fecha y Hora de Captura', "
-        "metodo AS Metodo, foto_path AS FotoPath "
+        "SELECT iccid AS ICCID, imei AS IMEI, tienda AS Tienda, "
+        "fecha_hora AS 'Fecha y Hora de Captura', metodo AS Metodo, "
+        "foto_path AS FotoPath "
         "FROM chips ORDER BY id DESC",
         conn,
     )
@@ -109,10 +114,11 @@ def iccid_exists(conn, iccid):
     return cur.fetchone() is not None
 
 
-def insert_chip(conn, iccid, metodo, foto_path, tienda):
+def insert_chip(conn, iccid, metodo, foto_path, tienda, imei):
     conn.execute(
-        "INSERT INTO chips (iccid, fecha_hora, metodo, foto_path, tienda) VALUES (?, ?, ?, ?, ?)",
-        (iccid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), metodo, foto_path, tienda),
+        "INSERT INTO chips (iccid, fecha_hora, metodo, foto_path, tienda, imei) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (iccid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), metodo, foto_path, tienda, imei),
     )
     conn.commit()
 
@@ -142,53 +148,8 @@ def save_photo(iccid, img_bytes):
 
 
 # ----------------------------------------------------------------------
-# Deteccion del codigo: 1) barcode/QR  2) OCR  3) manual
+# Deteccion de codigos: ICCID e IMEI/REIF, por codigo de barras/QR y OCR
 # ----------------------------------------------------------------------
-def _extract_iccid_from_digits(digits):
-    """Dado un string de puros digitos, intenta extraer un ICCID valido."""
-    m = ICCID_REGEX.search(digits)
-    if m:
-        return m.group(0)
-    m = DIGIT_RUN_REGEX.search(digits)
-    if m:
-        return m.group(0)
-    if len(digits) >= 15:
-        return digits
-    return None
-
-
-def try_barcode(image_pil):
-    if not ZBAR_AVAILABLE:
-        return None
-    img = np.array(image_pil.convert("L"))
-    candidates = []
-    for result in zbar_decode(img):
-        data = result.data.decode("utf-8", errors="ignore").strip()
-        # Solo considerar codigos de barras puramente numericos. El ICCID no
-        # lleva letras; otros codigos de la misma etiqueta (ej. IMEI/REIF)
-        # si suelen incluir una letra, y no queremos confundirlos con el ICCID.
-        if not data.isdigit():
-            continue
-        candidates.append(data)
-    if not candidates:
-        return None
-    # Preferir un ICCID "clasico" (empieza en 89) entre todos los codigos leidos
-    for digits in candidates:
-        m = ICCID_REGEX.search(digits)
-        if m:
-            return m.group(0)
-    # Si no, cualquier corrida de 18-20 digitos
-    for digits in candidates:
-        m = DIGIT_RUN_REGEX.search(digits)
-        if m:
-            return m.group(0)
-    # Ultimo recurso: el codigo mas largo leido
-    long_candidates = [d for d in candidates if len(d) >= 15]
-    if long_candidates:
-        return max(long_candidates, key=len)
-    return None
-
-
 def _preprocess_for_ocr(image_pil):
     img = np.array(image_pil.convert("L"))
     if CV2_AVAILABLE:
@@ -197,77 +158,101 @@ def _preprocess_for_ocr(image_pil):
     return img
 
 
-def try_ocr(image_pil):
-    """Lee texto con OCR y busca un ICCID. Procesa linea por linea para no
-    mezclar digitos de distintas partes de la etiqueta (ej. ICCID vs IMEI)."""
-    if not TESSERACT_AVAILABLE:
-        return None
-    processed = _preprocess_for_ocr(image_pil)
-    configs = [
-        "--psm 6 -c tessedit_char_whitelist=0123456789",
-        "--psm 11 -c tessedit_char_whitelist=0123456789",
-    ]
+def collect_candidates(image_pil):
+    """Recolecta posibles numeros (solo digitos) desde codigo de barras y OCR.
+    Devuelve una lista de tuplas (digitos, fuente)."""
+    candidates = []
 
-    lines_digits = []
-    for config in configs:
-        try:
-            text = pytesseract.image_to_string(processed, config=config)
-        except Exception:
-            continue
-        for line in text.splitlines():
-            digits = re.sub(r"\D", "", line)
-            if digits:
-                lines_digits.append(digits)
+    if ZBAR_AVAILABLE:
+        img = np.array(image_pil.convert("L"))
+        for result in zbar_decode(img):
+            data = result.data.decode("utf-8", errors="ignore").strip()
+            digits = re.sub(r"\D", "", data)
+            if len(digits) >= 10:
+                candidates.append((digits, "Codigo de barras/QR"))
 
-    if not lines_digits:
-        return None
+    if TESSERACT_AVAILABLE:
+        processed = _preprocess_for_ocr(image_pil)
+        configs = [
+            "--psm 6 -c tessedit_char_whitelist=0123456789",
+            "--psm 11 -c tessedit_char_whitelist=0123456789",
+        ]
+        for config in configs:
+            try:
+                text = pytesseract.image_to_string(processed, config=config)
+            except Exception:
+                continue
+            for line in text.splitlines():
+                digits = re.sub(r"\D", "", line)
+                if len(digits) >= 10:
+                    candidates.append((digits, "OCR"))
 
-    # 1) preferir un ICCID "clasico" (empieza en 89) en alguna linea
-    for digits in lines_digits:
+    return candidates
+
+
+def detect_codes(image_pil):
+    """Detecta el ICCID y, si existe, el IMEI/REIF (otro numero largo) en la
+    foto. Devuelve (iccid, iccid_metodo, imei, imei_metodo)."""
+    candidates = collect_candidates(image_pil)
+    if not candidates:
+        return None, "Manual", None, "Manual"
+
+    iccid = None
+    iccid_metodo = "Manual"
+    imei = None
+    imei_metodo = "Manual"
+
+    # 1) ICCID "clasico" (empieza en 89)
+    for digits, fuente in candidates:
         m = ICCID_REGEX.search(digits)
         if m:
-            return m.group(0)
-    # 2) si no, cualquier corrida de 18-20 digitos en alguna linea
-    for digits in lines_digits:
-        m = DIGIT_RUN_REGEX.search(digits)
-        if m:
-            return m.group(0)
-    # 3) ultimo recurso: la linea de digitos mas larga (>=15)
-    long_lines = [d for d in lines_digits if len(d) >= 15]
-    if long_lines:
-        return max(long_lines, key=len)
-    return None
+            iccid = m.group(0)
+            iccid_metodo = fuente
+            break
 
+    # 2) Si no hay ICCID clasico, usar cualquier corrida de 18-20 digitos
+    if not iccid:
+        for digits, fuente in candidates:
+            m = DIGIT_RUN_REGEX.search(digits)
+            if m:
+                iccid = m.group(0)
+                iccid_metodo = fuente
+                break
 
-def detect_code(image_pil):
-    code = try_barcode(image_pil)
-    if code:
-        return code, "Codigo de barras/QR"
-    code = try_ocr(image_pil)
-    if code:
-        return code, "OCR"
-    return None, "Manual"
+    # 3) IMEI/REIF: otro numero largo (14-20 digitos) distinto del ICCID
+    for digits, fuente in candidates:
+        if iccid and (digits == iccid or iccid in digits):
+            continue
+        if len(digits) >= 14:
+            imei = digits[:20]
+            imei_metodo = fuente
+            break
+
+    return iccid, iccid_metodo, imei, imei_metodo
 
 
 def build_excel_with_photos(df_full):
-    """Genera el Excel con ICCID, tienda, fecha, metodo y una miniatura de la foto de cada chip."""
+    """Genera el Excel con ICCID, IMEI, tienda, fecha, metodo y una miniatura
+    de la foto de cada chip."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Inventario SIM"
 
-    headers = ["ICCID", "Tienda", "Fecha y Hora de Captura", "Metodo", "Foto"]
+    headers = ["ICCID", "IMEI", "Tienda", "Fecha y Hora de Captura", "Metodo", "Foto"]
     ws.append(headers)
     ws.column_dimensions["A"].width = 24
-    ws.column_dimensions["B"].width = 18
-    ws.column_dimensions["C"].width = 20
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 18
     ws.column_dimensions["D"].width = 20
-    ws.column_dimensions[get_column_letter(5)].width = 14
+    ws.column_dimensions["E"].width = 20
+    ws.column_dimensions[get_column_letter(6)].width = 14
 
     for i, row in enumerate(df_full.itertuples(index=False), start=2):
         ws.cell(row=i, column=1, value=row.ICCID)
-        ws.cell(row=i, column=2, value=row.Tienda)
-        ws.cell(row=i, column=3, value=getattr(row, "_2"))
-        ws.cell(row=i, column=4, value=row.Metodo)
+        ws.cell(row=i, column=2, value=row.IMEI)
+        ws.cell(row=i, column=3, value=row.Tienda)
+        ws.cell(row=i, column=4, value=getattr(row, "_3"))
+        ws.cell(row=i, column=5, value=row.Metodo)
         ws.row_dimensions[i].height = 70
 
         foto_path = row.FotoPath
@@ -276,11 +261,11 @@ def build_excel_with_photos(df_full):
                 xl_img = XLImage(foto_path)
                 xl_img.width = THUMB_PX
                 xl_img.height = THUMB_PX
-                ws.add_image(xl_img, f"E{i}")
+                ws.add_image(xl_img, f"F{i}")
             except Exception:
-                ws.cell(row=i, column=5, value="(no se pudo insertar)")
+                ws.cell(row=i, column=6, value="(no se pudo insertar)")
         else:
-            ws.cell(row=i, column=5, value="(sin foto)")
+            ws.cell(row=i, column=6, value="(sin foto)")
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -298,6 +283,8 @@ conn = get_connection()
 defaults = {
     "detected_code": "",
     "detected_metodo": "Manual",
+    "detected_imei": "",
+    "detected_imei_metodo": "Manual",
     "captured_image_bytes": None,
     "input_key": 0,
     "camera_key": 0,
@@ -369,9 +356,9 @@ else:
 
     st.subheader("1. Escanear")
     st.caption(
-        "En celular: usa la camara trasera. Acercate lo suficiente para que el "
-        "codigo de barras o el numero ICCID llenen la mayor parte del encuadre "
-        "(evita capturar toda la etiqueta completa) y procura buena luz sin brillos."
+        "En celular: usa la camara trasera. Acercate lo suficiente para que los "
+        "codigos/numeros llenen la mayor parte del encuadre y procura buena luz "
+        "sin brillos. La app intenta leer el ICCID y el IMEI/REIF en la misma foto."
     )
     img_file = st.camera_input(
         "Toma una foto del ICCID / codigo de barras del chip",
@@ -382,13 +369,17 @@ else:
         img_bytes = img_file.getvalue()
         image = Image.open(io.BytesIO(img_bytes))
         with st.spinner("Analizando imagen..."):
-            code, metodo = detect_code(image)
-        if code:
-            st.success(f"Codigo detectado ({metodo}): {code}")
+            iccid_code, iccid_metodo, imei_code, imei_metodo = detect_codes(image)
+        if iccid_code:
+            st.success(f"ICCID detectado ({iccid_metodo}): {iccid_code}")
         else:
-            st.warning("No se detecto el codigo automaticamente. Ingresalo manualmente abajo.")
-        st.session_state.detected_code = code or ""
-        st.session_state.detected_metodo = metodo
+            st.warning("No se detecto el ICCID automaticamente. Ingresalo manualmente abajo.")
+        if imei_code:
+            st.info(f"IMEI/REIF detectado ({imei_metodo}): {imei_code}")
+        st.session_state.detected_code = iccid_code or ""
+        st.session_state.detected_metodo = iccid_metodo
+        st.session_state.detected_imei = imei_code or ""
+        st.session_state.detected_imei_metodo = imei_metodo
         st.session_state.captured_image_bytes = img_bytes
 
     iccid_input = st.text_input(
@@ -396,6 +387,12 @@ else:
         value=st.session_state.detected_code,
         max_chars=22,
         key=f"iccid_input_{st.session_state.input_key}",
+    )
+    imei_input = st.text_input(
+        "IMEI / REIF (opcional, verifica o corrige antes de guardar)",
+        value=st.session_state.detected_imei,
+        max_chars=22,
+        key=f"imei_input_{st.session_state.input_key}",
     )
 
     col1, col2 = st.columns(2)
@@ -406,6 +403,7 @@ else:
 
     if guardar:
         clean = re.sub(r"\D", "", iccid_input)
+        clean_imei = re.sub(r"\D", "", imei_input) or None
         if not clean:
             st.error("Ingresa un ICCID valido.")
         elif len(clean) < 15:
@@ -420,10 +418,11 @@ else:
                     st.warning("No se pudo guardar la foto, pero el registro si se guardo.")
             insert_chip(
                 conn, clean, st.session_state.detected_metodo, foto_path,
-                st.session_state.tienda_seleccionada,
+                st.session_state.tienda_seleccionada, clean_imei,
             )
             st.success(f"Chip guardado: {clean}")
             st.session_state.detected_code = ""
+            st.session_state.detected_imei = ""
             st.session_state.captured_image_bytes = None
             st.session_state.input_key += 1
             st.session_state.camera_key += 1
@@ -431,6 +430,7 @@ else:
 
     if limpiar:
         st.session_state.detected_code = ""
+        st.session_state.detected_imei = ""
         st.session_state.captured_image_bytes = None
         st.session_state.input_key += 1
         st.session_state.camera_key += 1
