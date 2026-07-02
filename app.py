@@ -8,8 +8,10 @@ foto de cada chip y permite exportar todo (datos + miniaturas de fotos)
 a un Excel.
 
 Incluye login de administrador (unico que puede descargar el Excel), un
-selector de tienda que cada usuario elige una vez por sesion, y un panel
-de diagnostico para depurar por que no se detecta un codigo.
+selector de tienda que cada usuario elige una vez por sesion, un panel
+de diagnostico para depurar por que no se detecta un codigo, y un modo
+experimental de escaneo en vivo de codigo de barras usando la camara
+(API BarcodeDetector del navegador).
 
 Ejecutar con:
     streamlit run app.py
@@ -24,6 +26,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.utils import get_column_letter
@@ -66,6 +69,71 @@ TIENDAS = ["Tienda 1", "Tienda 2", "Tienda 3", "Tienda 4", "Tienda 5"]
 # Contrasena de administrador: se lee de .streamlit/secrets.toml (clave ADMIN_PASSWORD).
 # Nunca queda escrita en este archivo. Ver README para configurarla.
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
+
+# HTML/JS del escaneo en vivo: usa la API nativa BarcodeDetector del navegador
+# (disponible en Chrome/Android). Al detectar un codigo, recarga la pagina
+# agregando ?scanned=<codigo> a la URL; Python lo recoge en el arranque.
+LIVE_SCANNER_HTML = """
+<div style="font-family: sans-serif;">
+  <video id="video" style="width:100%; max-width:480px; border-radius:8px; background:#000;"
+         autoplay playsinline muted></video>
+  <p id="status" style="color:#555; font-size:14px;">Iniciando camara...</p>
+</div>
+<script>
+(async function() {
+  const statusEl = document.getElementById('status');
+  const video = document.getElementById('video');
+
+  if (!('BarcodeDetector' in window)) {
+    statusEl.textContent = 'Tu navegador no soporta el escaneo en vivo (BarcodeDetector). Usa la opcion de foto normal abajo.';
+    return;
+  }
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' } }
+    });
+  } catch (e) {
+    statusEl.textContent = 'No se pudo acceder a la camara: ' + e.message;
+    return;
+  }
+  video.srcObject = stream;
+
+  let detector;
+  try {
+    const formats = await BarcodeDetector.getSupportedFormats();
+    detector = new BarcodeDetector({ formats: formats });
+  } catch (e) {
+    detector = new BarcodeDetector();
+  }
+
+  statusEl.textContent = 'Apunta la camara al codigo de barras del chip...';
+
+  let found = false;
+  async function scanLoop() {
+    if (found) return;
+    try {
+      const barcodes = await detector.detect(video);
+      if (barcodes.length > 0) {
+        found = true;
+        const raw = (barcodes[0].rawValue || '').trim();
+        statusEl.textContent = 'Codigo detectado: ' + raw + ' - actualizando...';
+        stream.getTracks().forEach(t => t.stop());
+        const url = new URL(window.top.location.href);
+        url.searchParams.set('scanned', raw);
+        window.top.location.href = url.toString();
+        return;
+      }
+    } catch (e) {
+      // seguir intentando en el siguiente cuadro
+    }
+    requestAnimationFrame(scanLoop);
+  }
+  requestAnimationFrame(scanLoop);
+})();
+</script>
+"""
 
 
 # ----------------------------------------------------------------------
@@ -333,6 +401,20 @@ for key, default in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
+# Restaurar tienda si la pagina se recargo por el escaneo en vivo (la tienda
+# queda en la URL para sobrevivir la recarga, ya que esta reinicia la sesion).
+if not st.session_state.tienda_seleccionada and "tienda" in st.query_params:
+    st.session_state.tienda_seleccionada = st.query_params["tienda"]
+
+# Si el escaneo en vivo detecto un codigo, viene en el query param "scanned".
+if "scanned" in st.query_params:
+    scanned_digits = re.sub(r"\D", "", st.query_params.get("scanned", ""))
+    if scanned_digits:
+        st.session_state.detected_code = scanned_digits
+        st.session_state.detected_metodo = "Codigo de barras (en vivo)"
+        st.session_state.input_key += 1
+    del st.query_params["scanned"]
+
 top_col1, top_col2 = st.columns([5, 1])
 with top_col1:
     st.title("Inventario de Chips SIM")
@@ -384,6 +466,7 @@ if not st.session_state.tienda_seleccionada:
     )
     if st.button("Confirmar tienda", type="primary", disabled=(tienda_choice is None)):
         st.session_state.tienda_seleccionada = tienda_choice
+        st.query_params["tienda"] = tienda_choice
         st.rerun()
     st.info(
         "Selecciona tu tienda para comenzar a escanear. Esta eleccion queda fija "
@@ -391,13 +474,28 @@ if not st.session_state.tienda_seleccionada:
     )
 else:
     st.caption(f"Tienda seleccionada: **{st.session_state.tienda_seleccionada}**")
+    if "tienda" not in st.query_params:
+        st.query_params["tienda"] = st.session_state.tienda_seleccionada
 
     st.subheader("1. Escanear")
+
+    usar_camara_viva = st.checkbox(
+        "Probar escaneo en vivo con la camara (experimental, solo lee codigo de barras)"
+    )
+    if usar_camara_viva:
+        components.html(LIVE_SCANNER_HTML, height=440)
+        st.caption(
+            "Apunta al codigo de barras y espera. Si tu navegador la soporta, al "
+            "detectar el codigo la pagina se recargara sola y lo completara abajo. "
+            "Si ves un mensaje de 'no soportado', usa la foto normal mas abajo."
+        )
+        st.divider()
+
     st.caption(
-        "En celular: usa la camara trasera, sostenla DE FRENTE al codigo (no en "
-        "angulo/inclinada), acercate para que los numeros llenen bien el encuadre, "
-        "y procura buena luz sin brillos ni sombras. "
-        "La app intenta leer el ICCID y el IMEI/REIF en la misma foto."
+        "Foto (respaldo / OCR): usa la camara trasera, sostenla DE FRENTE al "
+        "codigo (no en angulo/inclinada), acercate para que los numeros llenen "
+        "bien el encuadre, y procura buena luz sin brillos ni sombras. La app "
+        "intenta leer el ICCID y el IMEI/REIF en la misma foto."
     )
     img_file = st.camera_input(
         "Toma una foto del ICCID / codigo de barras del chip",
