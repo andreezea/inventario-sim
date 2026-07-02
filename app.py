@@ -7,8 +7,9 @@ evita duplicados de ICCID, muestra la lista en tiempo real, guarda la
 foto de cada chip y permite exportar todo (datos + miniaturas de fotos)
 a un Excel.
 
-Incluye login de administrador (unico que puede descargar el Excel) y
-un selector de tienda que cada usuario elige una vez por sesion.
+Incluye login de administrador (unico que puede descargar el Excel), un
+selector de tienda que cada usuario elige una vez por sesion, y un panel
+de diagnostico para depurar por que no se detecta un codigo.
 
 Ejecutar con:
     streamlit run app.py
@@ -177,16 +178,30 @@ def _preprocess_for_ocr(image_pil):
 
 def collect_candidates(image_pil):
     """Recolecta posibles numeros (solo digitos) desde codigo de barras y OCR.
-    Devuelve una lista de tuplas (digitos, fuente)."""
+    Devuelve (candidates, debug): candidates es una lista de tuplas
+    (digitos, fuente); debug es un dict con detalles crudos para diagnostico
+    (que se puede mostrar en pantalla si la deteccion automatica falla)."""
     candidates = []
+    debug = {
+        "zbar_disponible": ZBAR_AVAILABLE,
+        "zbar_lecturas": [],
+        "zbar_error": None,
+        "ocr_disponible": TESSERACT_AVAILABLE,
+        "ocr_lineas": [],
+        "ocr_error": None,
+    }
 
     if ZBAR_AVAILABLE:
-        img = np.array(image_pil.convert("L"))
-        for result in zbar_decode(img):
-            data = result.data.decode("utf-8", errors="ignore").strip()
-            digits = re.sub(r"\D", "", data)
-            if len(digits) >= 10:
-                candidates.append((digits, "Codigo de barras/QR"))
+        try:
+            img = np.array(image_pil.convert("L"))
+            for result in zbar_decode(img):
+                data = result.data.decode("utf-8", errors="ignore").strip()
+                debug["zbar_lecturas"].append(data)
+                digits = re.sub(r"\D", "", data)
+                if len(digits) >= 10:
+                    candidates.append((digits, "Codigo de barras/QR"))
+        except Exception as e:
+            debug["zbar_error"] = f"{type(e).__name__}: {e}"
 
     if TESSERACT_AVAILABLE:
         processed = _preprocess_for_ocr(image_pil)
@@ -197,23 +212,27 @@ def collect_candidates(image_pil):
         for config in configs:
             try:
                 text = pytesseract.image_to_string(processed, config=config)
-            except Exception:
+            except Exception as e:
+                debug["ocr_error"] = f"{type(e).__name__}: {e}"
                 continue
             for line in text.splitlines():
+                line = line.strip()
+                if line:
+                    debug["ocr_lineas"].append(line)
                 digits = re.sub(r"\D", "", line)
                 if len(digits) >= 10:
                     candidates.append((digits, "OCR"))
 
-    return candidates
+    return candidates, debug
 
 
 def detect_codes(image_pil):
     """Detecta el ICCID y, si existe, el IMEI/REIF (otro numero largo) en la
-    foto. Devuelve (iccid, iccid_metodo, imei, imei_metodo)."""
+    foto. Devuelve (iccid, iccid_metodo, imei, imei_metodo, debug)."""
     image_pil = _normalize_image(image_pil)
-    candidates = collect_candidates(image_pil)
+    candidates, debug = collect_candidates(image_pil)
     if not candidates:
-        return None, "Manual", None, "Manual"
+        return None, "Manual", None, "Manual", debug
 
     iccid = None
     iccid_metodo = "Manual"
@@ -246,7 +265,7 @@ def detect_codes(image_pil):
             imei_metodo = fuente
             break
 
-    return iccid, iccid_metodo, imei, imei_metodo
+    return iccid, iccid_metodo, imei, imei_metodo, debug
 
 
 def build_excel_with_photos(df_full):
@@ -308,6 +327,7 @@ defaults = {
     "camera_key": 0,
     "is_admin": False,
     "tienda_seleccionada": None,
+    "last_debug": None,
 }
 for key, default in defaults.items():
     if key not in st.session_state:
@@ -388,7 +408,7 @@ else:
         img_bytes = img_file.getvalue()
         image = Image.open(io.BytesIO(img_bytes))
         with st.spinner("Analizando imagen..."):
-            iccid_code, iccid_metodo, imei_code, imei_metodo = detect_codes(image)
+            iccid_code, iccid_metodo, imei_code, imei_metodo, debug_info = detect_codes(image)
         if iccid_code:
             st.success(f"ICCID detectado ({iccid_metodo}): {iccid_code}")
         else:
@@ -400,6 +420,24 @@ else:
         st.session_state.detected_imei = imei_code or ""
         st.session_state.detected_imei_metodo = imei_metodo
         st.session_state.captured_image_bytes = img_bytes
+        st.session_state.last_debug = debug_info
+
+    if st.session_state.last_debug:
+        d = st.session_state.last_debug
+        with st.expander("Ver diagnostico de lectura (util si no detecta nada)"):
+            st.write(f"Lectura de codigo de barras disponible: {d['zbar_disponible']}")
+            if d["zbar_error"]:
+                st.error(f"Error al leer codigo de barras: {d['zbar_error']}")
+            st.write(f"Codigos de barras detectados en la foto: {len(d['zbar_lecturas'])}")
+            for lectura in d["zbar_lecturas"]:
+                st.code(lectura)
+            st.divider()
+            st.write(f"OCR disponible: {d['ocr_disponible']}")
+            if d["ocr_error"]:
+                st.error(f"Error en OCR: {d['ocr_error']}")
+            st.write(f"Lineas de texto leidas por OCR: {len(d['ocr_lineas'])}")
+            for linea in d["ocr_lineas"]:
+                st.code(linea)
 
     iccid_input = st.text_input(
         "ICCID (verifica o corrige antes de guardar)",
@@ -443,6 +481,7 @@ else:
             st.session_state.detected_code = ""
             st.session_state.detected_imei = ""
             st.session_state.captured_image_bytes = None
+            st.session_state.last_debug = None
             st.session_state.input_key += 1
             st.session_state.camera_key += 1
             st.rerun()
@@ -451,6 +490,7 @@ else:
         st.session_state.detected_code = ""
         st.session_state.detected_imei = ""
         st.session_state.captured_image_bytes = None
+        st.session_state.last_debug = None
         st.session_state.input_key += 1
         st.session_state.camera_key += 1
         st.rerun()
