@@ -1,15 +1,17 @@
 """
 Inventario de Chips SIM - App interna de control de inventario
 ================================================================
-Captura fotos con la cámara del celular/laptop, detecta el ICCID por
-código de barras/QR (pyzbar) o por OCR (pytesseract), evita duplicados,
-muestra la lista en tiempo real y permite exportar a Excel.
+Captura fotos con la camara del celular/laptop, detecta el ICCID por
+codigo de barras/QR (pyzbar) o por OCR (pytesseract), evita duplicados,
+muestra la lista en tiempo real, guarda la foto de cada chip y permite
+exportar todo (datos + miniaturas de fotos) a un Excel.
 
 Ejecutar con:
     streamlit run app.py
 """
 
 import io
+import os
 import re
 import sqlite3
 from datetime import datetime
@@ -17,11 +19,14 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.utils import get_column_letter
 from PIL import Image
 
 # ----------------------------------------------------------------------
 # Dependencias opcionales: la app debe seguir funcionando (modo manual)
-# aunque falten librerías de sistema (zbar / tesseract) en el equipo.
+# aunque falten librerias de sistema (zbar / tesseract) en el equipo.
 # ----------------------------------------------------------------------
 try:
     from pyzbar.pyzbar import decode as zbar_decode
@@ -42,8 +47,10 @@ except Exception:
     TESSERACT_AVAILABLE = False
 
 DB_PATH = "inventario_sim.db"
-# ICCID: empieza en 89 (industria de telecom), 19-20 dígitos en total
+FOTOS_DIR = "fotos_chips"
+# ICCID: empieza en 89 (industria de telecom), 19-20 digitos en total
 ICCID_REGEX = re.compile(r"89\d{16,18}")
+THUMB_PX = 90  # tamano de la miniatura embebida en el Excel
 
 
 # ----------------------------------------------------------------------
@@ -58,44 +65,70 @@ def get_connection():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             iccid TEXT UNIQUE NOT NULL,
             fecha_hora TEXT NOT NULL,
-            metodo TEXT
+            metodo TEXT,
+            foto_path TEXT
         )
         """
     )
+    # Migracion simple para bases de datos creadas con una version anterior
+    # de la app (sin columna foto_path).
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(chips)").fetchall()]
+    if "foto_path" not in cols:
+        conn.execute("ALTER TABLE chips ADD COLUMN foto_path TEXT")
     conn.commit()
     return conn
 
 
-def get_all(conn: sqlite3.Connection) -> pd.DataFrame:
+def get_all(conn):
     return pd.read_sql_query(
         "SELECT iccid AS ICCID, fecha_hora AS 'Fecha y Hora de Captura', "
-        "metodo AS 'Metodo' FROM chips ORDER BY id DESC",
+        "metodo AS Metodo, foto_path AS FotoPath "
+        "FROM chips ORDER BY id DESC",
         conn,
     )
 
 
-def iccid_exists(conn: sqlite3.Connection, iccid: str) -> bool:
+def iccid_exists(conn, iccid):
     cur = conn.execute("SELECT 1 FROM chips WHERE iccid = ?", (iccid,))
     return cur.fetchone() is not None
 
 
-def insert_chip(conn: sqlite3.Connection, iccid: str, metodo: str) -> None:
+def insert_chip(conn, iccid, metodo, foto_path):
     conn.execute(
-        "INSERT INTO chips (iccid, fecha_hora, metodo) VALUES (?, ?, ?)",
-        (iccid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), metodo),
+        "INSERT INTO chips (iccid, fecha_hora, metodo, foto_path) VALUES (?, ?, ?, ?)",
+        (iccid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), metodo, foto_path),
     )
     conn.commit()
 
 
-def delete_chip(conn: sqlite3.Connection, iccid: str) -> None:
+def delete_chip(conn, iccid):
+    row = conn.execute("SELECT foto_path FROM chips WHERE iccid = ?", (iccid,)).fetchone()
     conn.execute("DELETE FROM chips WHERE iccid = ?", (iccid,))
     conn.commit()
+    if row and row[0] and os.path.exists(row[0]):
+        try:
+            os.remove(row[0])
+        except OSError:
+            pass
+
+
+def save_photo(iccid, img_bytes):
+    """Guarda la foto en disco (comprimida) asociada al ICCID. Devuelve la ruta o None si falla."""
+    try:
+        os.makedirs(FOTOS_DIR, exist_ok=True)
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        image.thumbnail((1000, 1000))
+        path = os.path.join(FOTOS_DIR, f"{iccid}.jpg")
+        image.save(path, "JPEG", quality=75)
+        return path
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------------
-# Detección del código: 1) barcode/QR  2) OCR  3) manual
+# Deteccion del codigo: 1) barcode/QR  2) OCR  3) manual
 # ----------------------------------------------------------------------
-def _extract_iccid_from_digits(digits: str) -> str | None:
+def _extract_iccid_from_digits(digits):
     m = ICCID_REGEX.search(digits)
     if m:
         return m.group(0)
@@ -104,7 +137,7 @@ def _extract_iccid_from_digits(digits: str) -> str | None:
     return None
 
 
-def try_barcode(image_pil: Image.Image) -> str | None:
+def try_barcode(image_pil):
     if not ZBAR_AVAILABLE:
         return None
     img = np.array(image_pil.convert("L"))
@@ -117,7 +150,7 @@ def try_barcode(image_pil: Image.Image) -> str | None:
     return None
 
 
-def _preprocess_for_ocr(image_pil: Image.Image):
+def _preprocess_for_ocr(image_pil):
     img = np.array(image_pil.convert("L"))
     if CV2_AVAILABLE:
         img = cv2.GaussianBlur(img, (3, 3), 0)
@@ -125,7 +158,7 @@ def _preprocess_for_ocr(image_pil: Image.Image):
     return img
 
 
-def try_ocr(image_pil: Image.Image) -> str | None:
+def try_ocr(image_pil):
     if not TESSERACT_AVAILABLE:
         return None
     processed = _preprocess_for_ocr(image_pil)
@@ -139,31 +172,72 @@ def try_ocr(image_pil: Image.Image) -> str | None:
     return m.group(0) if m else None
 
 
-def detect_code(image_pil: Image.Image):
+def detect_code(image_pil):
     code = try_barcode(image_pil)
     if code:
-        return code, "Código de barras/QR"
+        return code, "Codigo de barras/QR"
     code = try_ocr(image_pil)
     if code:
         return code, "OCR"
     return None, "Manual"
 
 
+def build_excel_with_photos(df_full):
+    """Genera el Excel con ICCID, fecha, metodo y una miniatura de la foto de cada chip."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Inventario SIM"
+
+    headers = ["ICCID", "Fecha y Hora de Captura", "Metodo", "Foto"]
+    ws.append(headers)
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 20
+    ws.column_dimensions["C"].width = 20
+    ws.column_dimensions[get_column_letter(4)].width = 14
+
+    for i, row in enumerate(df_full.itertuples(index=False), start=2):
+        ws.cell(row=i, column=1, value=row.ICCID)
+        ws.cell(row=i, column=2, value=getattr(row, "_1"))
+        ws.cell(row=i, column=3, value=row.Metodo)
+        ws.row_dimensions[i].height = 70
+
+        foto_path = row.FotoPath
+        if foto_path and os.path.exists(foto_path):
+            try:
+                xl_img = XLImage(foto_path)
+                xl_img.width = THUMB_PX
+                xl_img.height = THUMB_PX
+                ws.add_image(xl_img, f"D{i}")
+            except Exception:
+                ws.cell(row=i, column=4, value="(no se pudo insertar)")
+        else:
+            ws.cell(row=i, column=4, value="(sin foto)")
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
 # ----------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------
-st.set_page_config(page_title="Inventario Chips SIM", page_icon="📶", layout="centered")
+st.set_page_config(page_title="Inventario Chips SIM", page_icon="Chip", layout="centered")
 
 conn = get_connection()
 
-if "detected_code" not in st.session_state:
-    st.session_state.detected_code = ""
-if "detected_metodo" not in st.session_state:
-    st.session_state.detected_metodo = "Manual"
-if "input_key" not in st.session_state:
-    st.session_state.input_key = 0
+defaults = {
+    "detected_code": "",
+    "detected_metodo": "Manual",
+    "captured_image_bytes": None,
+    "input_key": 0,
+    "camera_key": 0,
+}
+for key, default in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-st.title("📶 Inventario de Chips SIM")
+st.title("Inventario de Chips SIM")
 
 total = conn.execute("SELECT COUNT(*) FROM chips").fetchone()[0]
 st.metric("Total de chips registrados", total)
@@ -171,28 +245,37 @@ st.metric("Total de chips registrados", total)
 if not ZBAR_AVAILABLE or not TESSERACT_AVAILABLE:
     faltantes = []
     if not ZBAR_AVAILABLE:
-        faltantes.append("lectura de código de barras/QR (zbar)")
+        faltantes.append("lectura de codigo de barras/QR (zbar)")
     if not TESSERACT_AVAILABLE:
         faltantes.append("OCR (tesseract)")
     st.warning(
-        "⚠️ No están disponibles: " + " y ".join(faltantes) +
-        ". Puedes seguir usando la app con captura/edición manual del ICCID. "
+        "No estan disponibles: " + " y ".join(faltantes) +
+        ". Puedes seguir usando la app con captura/edicion manual del ICCID. "
         "Revisa el README para instalar las dependencias de sistema."
     )
 
 st.subheader("1. Escanear")
-img_file = st.camera_input("Toma una foto del ICCID / código de barras del chip")
+st.caption(
+    "En celular: la vista de la camara trae un icono para cambiar entre camara "
+    "frontal y trasera. Usa la trasera para enfocar mejor el codigo del chip."
+)
+img_file = st.camera_input(
+    "Toma una foto del ICCID / codigo de barras del chip",
+    key=f"camera_{st.session_state.camera_key}",
+)
 
 if img_file is not None:
-    image = Image.open(img_file)
+    img_bytes = img_file.getvalue()
+    image = Image.open(io.BytesIO(img_bytes))
     with st.spinner("Analizando imagen..."):
         code, metodo = detect_code(image)
     if code:
-        st.success(f"Código detectado ({metodo}): {code}")
+        st.success(f"Codigo detectado ({metodo}): {code}")
     else:
-        st.warning("No se detectó el código automáticamente. Ingrésalo manualmente abajo.")
+        st.warning("No se detecto el codigo automaticamente. Ingresalo manualmente abajo.")
     st.session_state.detected_code = code or ""
     st.session_state.detected_metodo = metodo
+    st.session_state.captured_image_bytes = img_bytes
 
 iccid_input = st.text_input(
     "ICCID (verifica o corrige antes de guardar)",
@@ -203,57 +286,73 @@ iccid_input = st.text_input(
 
 col1, col2 = st.columns(2)
 with col1:
-    guardar = st.button("✅ Guardar registro", use_container_width=True, type="primary")
+    guardar = st.button("Guardar registro", use_container_width=True, type="primary")
 with col2:
-    limpiar = st.button("🔄 Limpiar", use_container_width=True)
+    limpiar = st.button("Limpiar", use_container_width=True)
 
 if guardar:
     clean = re.sub(r"\D", "", iccid_input)
     if not clean:
-        st.error("Ingresa un ICCID válido.")
+        st.error("Ingresa un ICCID valido.")
     elif len(clean) < 15:
         st.error("El ICCID parece incompleto (muy corto). Verifica la foto o el texto.")
     elif iccid_exists(conn, clean):
-        st.error(f"⚠️ Este chip ya fue escaneado antes: {clean}")
+        st.error(f"Este chip ya fue escaneado antes: {clean}")
     else:
-        insert_chip(conn, clean, st.session_state.detected_metodo)
+        foto_path = None
+        if st.session_state.captured_image_bytes:
+            foto_path = save_photo(clean, st.session_state.captured_image_bytes)
+            if foto_path is None:
+                st.warning("No se pudo guardar la foto, pero el registro si se guardo.")
+        insert_chip(conn, clean, st.session_state.detected_metodo, foto_path)
         st.success(f"Chip guardado: {clean}")
         st.session_state.detected_code = ""
+        st.session_state.captured_image_bytes = None
         st.session_state.input_key += 1
+        st.session_state.camera_key += 1
         st.rerun()
 
 if limpiar:
     st.session_state.detected_code = ""
+    st.session_state.captured_image_bytes = None
     st.session_state.input_key += 1
+    st.session_state.camera_key += 1
     st.rerun()
 
 st.divider()
 st.subheader("2. Chips escaneados")
 
-df = get_all(conn)
-st.dataframe(df, use_container_width=True, hide_index=True)
+df_full = get_all(conn)
+df_display = df_full.drop(columns=["FotoPath"]).copy()
+df_display.insert(
+    len(df_display.columns), "Foto",
+    df_full["FotoPath"].apply(lambda p: "Si" if p and os.path.exists(p) else "-")
+)
+st.dataframe(df_display, use_container_width=True, hide_index=True)
 
 st.divider()
 st.subheader("3. Exportar")
 
-if len(df) > 0:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Inventario SIM")
-    buffer.seek(0)
+if len(df_full) > 0:
+    with st.spinner("Generando Excel con fotos..."):
+        excel_buffer = build_excel_with_photos(df_full)
     st.download_button(
-        label="⬇️ Descargar Excel",
-        data=buffer,
+        label="Descargar Excel (incluye fotos)",
+        data=excel_buffer,
         file_name=f"inventario_sim_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+    st.caption(
+        "Nota: con varios cientos de chips, el Excel puede pesar varios MB y tardar "
+        "unos segundos en generarse por las fotos embebidas."
+    )
 else:
-    st.info("Aún no hay chips escaneados.")
+    st.info("Aun no hay chips escaneados.")
 
-with st.expander("🗑️ Eliminar un registro (correcciones)"):
-    if len(df) > 0:
-        to_delete = st.selectbox("Selecciona el ICCID a eliminar", df["ICCID"].tolist())
+with st.expander("Eliminar un registro (correcciones)"):
+    if len(df_full) > 0:
+        to_delete = st.selectbox("Selecciona el ICCID a eliminar", df_full["ICCID"].tolist())
         if st.button("Eliminar registro seleccionado"):
             delete_chip(conn, to_delete)
             st.rerun()
@@ -261,5 +360,6 @@ with st.expander("🗑️ Eliminar un registro (correcciones)"):
         st.caption("No hay registros para eliminar.")
 
 st.caption(
-    "Los datos se guardan localmente en `inventario_sim.db` en el equipo donde corre la app."
+    "Los datos se guardan localmente: la tabla en inventario_sim.db y las fotos en "
+    "la carpeta fotos_chips/, en el equipo donde corre la app."
 )
