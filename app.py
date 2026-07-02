@@ -6,6 +6,9 @@ codigo de barras/QR (pyzbar) o por OCR (pytesseract), evita duplicados,
 muestra la lista en tiempo real, guarda la foto de cada chip y permite
 exportar todo (datos + miniaturas de fotos) a un Excel.
 
+Incluye login de administrador (unico que puede descargar el Excel) y
+un selector de tienda que cada usuario elige una vez por sesion.
+
 Ejecutar con:
     streamlit run app.py
 """
@@ -52,6 +55,13 @@ FOTOS_DIR = "fotos_chips"
 ICCID_REGEX = re.compile(r"89\d{16,18}")
 THUMB_PX = 90  # tamano de la miniatura embebida en el Excel
 
+# Lista de tiendas para el selector. Edita esta lista con los nombres reales.
+TIENDAS = ["Tienda 1", "Tienda 2", "Tienda 3", "Tienda 4", "Tienda 5"]
+
+# Contrasena de administrador: se lee de .streamlit/secrets.toml (clave ADMIN_PASSWORD).
+# Nunca queda escrita en este archivo. Ver README para configurarla.
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
+
 
 # ----------------------------------------------------------------------
 # Base de datos (SQLite) - persiste entre sesiones y reinicios de la app
@@ -66,22 +76,25 @@ def get_connection():
             iccid TEXT UNIQUE NOT NULL,
             fecha_hora TEXT NOT NULL,
             metodo TEXT,
-            foto_path TEXT
+            foto_path TEXT,
+            tienda TEXT
         )
         """
     )
     # Migracion simple para bases de datos creadas con una version anterior
-    # de la app (sin columna foto_path).
+    # de la app (sin columna foto_path / tienda).
     cols = [row[1] for row in conn.execute("PRAGMA table_info(chips)").fetchall()]
     if "foto_path" not in cols:
         conn.execute("ALTER TABLE chips ADD COLUMN foto_path TEXT")
+    if "tienda" not in cols:
+        conn.execute("ALTER TABLE chips ADD COLUMN tienda TEXT")
     conn.commit()
     return conn
 
 
 def get_all(conn):
     return pd.read_sql_query(
-        "SELECT iccid AS ICCID, fecha_hora AS 'Fecha y Hora de Captura', "
+        "SELECT iccid AS ICCID, tienda AS Tienda, fecha_hora AS 'Fecha y Hora de Captura', "
         "metodo AS Metodo, foto_path AS FotoPath "
         "FROM chips ORDER BY id DESC",
         conn,
@@ -93,10 +106,10 @@ def iccid_exists(conn, iccid):
     return cur.fetchone() is not None
 
 
-def insert_chip(conn, iccid, metodo, foto_path):
+def insert_chip(conn, iccid, metodo, foto_path, tienda):
     conn.execute(
-        "INSERT INTO chips (iccid, fecha_hora, metodo, foto_path) VALUES (?, ?, ?, ?)",
-        (iccid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), metodo, foto_path),
+        "INSERT INTO chips (iccid, fecha_hora, metodo, foto_path, tienda) VALUES (?, ?, ?, ?, ?)",
+        (iccid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), metodo, foto_path, tienda),
     )
     conn.commit()
 
@@ -183,22 +196,24 @@ def detect_code(image_pil):
 
 
 def build_excel_with_photos(df_full):
-    """Genera el Excel con ICCID, fecha, metodo y una miniatura de la foto de cada chip."""
+    """Genera el Excel con ICCID, tienda, fecha, metodo y una miniatura de la foto de cada chip."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Inventario SIM"
 
-    headers = ["ICCID", "Fecha y Hora de Captura", "Metodo", "Foto"]
+    headers = ["ICCID", "Tienda", "Fecha y Hora de Captura", "Metodo", "Foto"]
     ws.append(headers)
     ws.column_dimensions["A"].width = 24
-    ws.column_dimensions["B"].width = 20
+    ws.column_dimensions["B"].width = 18
     ws.column_dimensions["C"].width = 20
-    ws.column_dimensions[get_column_letter(4)].width = 14
+    ws.column_dimensions["D"].width = 20
+    ws.column_dimensions[get_column_letter(5)].width = 14
 
     for i, row in enumerate(df_full.itertuples(index=False), start=2):
         ws.cell(row=i, column=1, value=row.ICCID)
-        ws.cell(row=i, column=2, value=getattr(row, "_1"))
-        ws.cell(row=i, column=3, value=row.Metodo)
+        ws.cell(row=i, column=2, value=row.Tienda)
+        ws.cell(row=i, column=3, value=getattr(row, "_2"))
+        ws.cell(row=i, column=4, value=row.Metodo)
         ws.row_dimensions[i].height = 70
 
         foto_path = row.FotoPath
@@ -207,11 +222,11 @@ def build_excel_with_photos(df_full):
                 xl_img = XLImage(foto_path)
                 xl_img.width = THUMB_PX
                 xl_img.height = THUMB_PX
-                ws.add_image(xl_img, f"D{i}")
+                ws.add_image(xl_img, f"E{i}")
             except Exception:
-                ws.cell(row=i, column=4, value="(no se pudo insertar)")
+                ws.cell(row=i, column=5, value="(no se pudo insertar)")
         else:
-            ws.cell(row=i, column=4, value="(sin foto)")
+            ws.cell(row=i, column=5, value="(sin foto)")
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -232,12 +247,35 @@ defaults = {
     "captured_image_bytes": None,
     "input_key": 0,
     "camera_key": 0,
+    "is_admin": False,
+    "tienda_seleccionada": None,
 }
 for key, default in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
-st.title("Inventario de Chips SIM")
+top_col1, top_col2 = st.columns([5, 1])
+with top_col1:
+    st.title("Inventario de Chips SIM")
+with top_col2:
+    st.write("")
+    with st.popover("Cuenta", use_container_width=True):
+        if st.session_state.is_admin:
+            st.success("Administrador conectado")
+            if st.button("Cerrar sesion", use_container_width=True):
+                st.session_state.is_admin = False
+                st.rerun()
+        else:
+            st.caption("Acceso de administrador")
+            admin_pwd = st.text_input("Contrasena", type="password", key="admin_pwd_field")
+            if st.button("Iniciar sesion", use_container_width=True):
+                if not ADMIN_PASSWORD:
+                    st.error("Contrasena de administrador no configurada (ver README).")
+                elif admin_pwd == ADMIN_PASSWORD:
+                    st.session_state.is_admin = True
+                    st.rerun()
+                else:
+                    st.error("Contrasena incorrecta.")
 
 total = conn.execute("SELECT COUNT(*) FROM chips").fetchone()[0]
 st.metric("Total de chips registrados", total)
@@ -254,70 +292,94 @@ if not ZBAR_AVAILABLE or not TESSERACT_AVAILABLE:
         "Revisa el README para instalar las dependencias de sistema."
     )
 
-st.subheader("1. Escanear")
-st.caption(
-    "En celular: la vista de la camara trae un icono para cambiar entre camara "
-    "frontal y trasera. Usa la trasera para enfocar mejor el codigo del chip."
-)
-img_file = st.camera_input(
-    "Toma una foto del ICCID / codigo de barras del chip",
-    key=f"camera_{st.session_state.camera_key}",
-)
+st.divider()
 
-if img_file is not None:
-    img_bytes = img_file.getvalue()
-    image = Image.open(io.BytesIO(img_bytes))
-    with st.spinner("Analizando imagen..."):
-        code, metodo = detect_code(image)
-    if code:
-        st.success(f"Codigo detectado ({metodo}): {code}")
-    else:
-        st.warning("No se detecto el codigo automaticamente. Ingresalo manualmente abajo.")
-    st.session_state.detected_code = code or ""
-    st.session_state.detected_metodo = metodo
-    st.session_state.captured_image_bytes = img_bytes
+if not st.session_state.tienda_seleccionada:
+    st.subheader("0. Selecciona tu tienda")
+    tienda_choice = st.selectbox(
+        "Tienda",
+        TIENDAS,
+        index=None,
+        placeholder="Elige una tienda...",
+        key="tienda_selectbox",
+    )
+    if st.button("Confirmar tienda", type="primary", disabled=(tienda_choice is None)):
+        st.session_state.tienda_seleccionada = tienda_choice
+        st.rerun()
+    st.info(
+        "Selecciona tu tienda para comenzar a escanear. Esta eleccion queda fija "
+        "durante tu sesion (no se puede cambiar sin recargar la pagina)."
+    )
+else:
+    st.caption(f"Tienda seleccionada: **{st.session_state.tienda_seleccionada}**")
 
-iccid_input = st.text_input(
-    "ICCID (verifica o corrige antes de guardar)",
-    value=st.session_state.detected_code,
-    max_chars=22,
-    key=f"iccid_input_{st.session_state.input_key}",
-)
+    st.subheader("1. Escanear")
+    st.caption(
+        "En celular: la vista de la camara trae un icono para cambiar entre camara "
+        "frontal y trasera. Usa la trasera para enfocar mejor el codigo del chip."
+    )
+    img_file = st.camera_input(
+        "Toma una foto del ICCID / codigo de barras del chip",
+        key=f"camera_{st.session_state.camera_key}",
+    )
 
-col1, col2 = st.columns(2)
-with col1:
-    guardar = st.button("Guardar registro", use_container_width=True, type="primary")
-with col2:
-    limpiar = st.button("Limpiar", use_container_width=True)
+    if img_file is not None:
+        img_bytes = img_file.getvalue()
+        image = Image.open(io.BytesIO(img_bytes))
+        with st.spinner("Analizando imagen..."):
+            code, metodo = detect_code(image)
+        if code:
+            st.success(f"Codigo detectado ({metodo}): {code}")
+        else:
+            st.warning("No se detecto el codigo automaticamente. Ingresalo manualmente abajo.")
+        st.session_state.detected_code = code or ""
+        st.session_state.detected_metodo = metodo
+        st.session_state.captured_image_bytes = img_bytes
 
-if guardar:
-    clean = re.sub(r"\D", "", iccid_input)
-    if not clean:
-        st.error("Ingresa un ICCID valido.")
-    elif len(clean) < 15:
-        st.error("El ICCID parece incompleto (muy corto). Verifica la foto o el texto.")
-    elif iccid_exists(conn, clean):
-        st.error(f"Este chip ya fue escaneado antes: {clean}")
-    else:
-        foto_path = None
-        if st.session_state.captured_image_bytes:
-            foto_path = save_photo(clean, st.session_state.captured_image_bytes)
-            if foto_path is None:
-                st.warning("No se pudo guardar la foto, pero el registro si se guardo.")
-        insert_chip(conn, clean, st.session_state.detected_metodo, foto_path)
-        st.success(f"Chip guardado: {clean}")
+    iccid_input = st.text_input(
+        "ICCID (verifica o corrige antes de guardar)",
+        value=st.session_state.detected_code,
+        max_chars=22,
+        key=f"iccid_input_{st.session_state.input_key}",
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        guardar = st.button("Guardar registro", use_container_width=True, type="primary")
+    with col2:
+        limpiar = st.button("Limpiar", use_container_width=True)
+
+    if guardar:
+        clean = re.sub(r"\D", "", iccid_input)
+        if not clean:
+            st.error("Ingresa un ICCID valido.")
+        elif len(clean) < 15:
+            st.error("El ICCID parece incompleto (muy corto). Verifica la foto o el texto.")
+        elif iccid_exists(conn, clean):
+            st.error(f"Este chip ya fue escaneado antes: {clean}")
+        else:
+            foto_path = None
+            if st.session_state.captured_image_bytes:
+                foto_path = save_photo(clean, st.session_state.captured_image_bytes)
+                if foto_path is None:
+                    st.warning("No se pudo guardar la foto, pero el registro si se guardo.")
+            insert_chip(
+                conn, clean, st.session_state.detected_metodo, foto_path,
+                st.session_state.tienda_seleccionada,
+            )
+            st.success(f"Chip guardado: {clean}")
+            st.session_state.detected_code = ""
+            st.session_state.captured_image_bytes = None
+            st.session_state.input_key += 1
+            st.session_state.camera_key += 1
+            st.rerun()
+
+    if limpiar:
         st.session_state.detected_code = ""
         st.session_state.captured_image_bytes = None
         st.session_state.input_key += 1
         st.session_state.camera_key += 1
         st.rerun()
-
-if limpiar:
-    st.session_state.detected_code = ""
-    st.session_state.captured_image_bytes = None
-    st.session_state.input_key += 1
-    st.session_state.camera_key += 1
-    st.rerun()
 
 st.divider()
 st.subheader("2. Chips escaneados")
@@ -333,7 +395,12 @@ st.dataframe(df_display, use_container_width=True, hide_index=True)
 st.divider()
 st.subheader("3. Exportar")
 
-if len(df_full) > 0:
+if not st.session_state.is_admin:
+    st.info(
+        "La descarga del Excel esta disponible solo para el administrador. "
+        "Inicia sesion desde el boton 'Cuenta' arriba a la derecha."
+    )
+elif len(df_full) > 0:
     with st.spinner("Generando Excel con fotos..."):
         excel_buffer = build_excel_with_photos(df_full)
     st.download_button(
